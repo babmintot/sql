@@ -1,0 +1,176 @@
+-- Задание 1
+SELECT COUNT(*) AS project_count
+FROM stroy.project
+WHERE EXTRACT(YEAR FROM sign_date) = 2023
+
+-- Задание 2
+SELECT 
+    justify_interval(SUM(AGE(p.birthdate))) AS total_age
+FROM stroy.employee e
+JOIN stroy.person p ON e.person_id = p.person_id
+WHERE e.hire_date >= '2022-01-01' AND e.hire_date < '2023-01-01';
+-- Задание 3
+SELECT 
+    p.first_name || ' ' || p.last_name AS full_name,
+    e.hire_date
+FROM stroy.employee e
+JOIN stroy.person p ON e.person_id = p.person_id
+WHERE p.last_name LIKE 'М_______'
+ORDER BY e.hire_date ASC, RANDOM()
+LIMIT 1;
+-- Задание 4
+SELECT COALESCE(
+    AVG(EXTRACT(YEAR FROM AGE(e.dismissal_date, p.birthdate)))::INTEGER,
+    0
+) AS avg_full_years
+FROM stroy.employee e
+JOIN stroy.person p ON e.person_id = p.person_id
+LEFT JOIN stroy.project pr ON p.person_id = pr.project_manager_id
+WHERE e.dismissal_date IS NOT NULL
+  AND pr.project_manager_id IS NULL;
+-- Задание 5
+SELECT COALESCE(SUM(pp.amount), 0) AS total_amount
+FROM stroy.project_payment pp
+JOIN stroy.project p ON pp.project_id = p.project_id
+JOIN stroy.customer c ON p.customer_id = c.customer_id
+JOIN stroy.address a ON c.address_id = a.address_id
+JOIN stroy.city ci ON a.city_id = ci.city_id
+JOIN stroy.country co ON ci.country_id = co.country_id
+WHERE ci.city_name = 'Жуковский'
+  AND co.country_name = 'Россия'
+  AND pp.fact_transaction_timestamp IS NOT NULL;
+-- Задание 6
+WITH manager_bonuses AS (
+    SELECT 
+        p.person_id AS manager_id,
+        p.last_name || ' ' || p.first_name AS full_name,
+        SUM(pr.project_cost * 0.01) AS bonus
+    FROM stroy.project pr
+    JOIN stroy.person p ON pr.project_manager_id = p.person_id
+    WHERE pr.status = 'Завершен'
+    GROUP BY p.person_id, p.last_name, p.first_name
+),
+max_bonus AS (
+    SELECT MAX(bonus) AS max_val
+    FROM manager_bonuses
+)
+SELECT 
+    mb.manager_id,
+    mb.full_name,
+    mb.bonus
+FROM manager_bonuses mb
+JOIN max_bonus mx ON mb.bonus = mx.max_val;
+
+-- Задание 7
+WITH cumulative_payments AS (
+    SELECT 
+        plan_payment_date AS payment_date,
+        SUM(amount) OVER (ORDER BY plan_payment_date ROWS UNBOUNDED PRECEDING) AS cum_sum
+    FROM stroy.project_payment
+    WHERE payment_type = 'Авансовый'
+      AND fact_transaction_timestamp IS NULL
+)
+SELECT 
+    payment_date,
+    cum_sum
+FROM cumulative_payments
+WHERE cum_sum > 30000000
+ORDER BY payment_date;
+
+--- Задание 8
+WITH RECURSIVE UnitHierarchy AS (
+    SELECT unit_id FROM stroy.company_structure WHERE unit_id = 17
+    UNION ALL
+    SELECT cs.unit_id
+    FROM stroy.company_structure cs
+    JOIN UnitHierarchy uh ON cs.parent_id = uh.unit_id
+)
+SELECT COALESCE(SUM(ep.salary * ep.rate), 0) AS total_effective_salary
+FROM stroy.employee_position ep
+JOIN stroy.position p ON ep.position_id = p.position_id
+WHERE p.unit_id IN (SELECT unit_id FROM UnitHierarchy);
+-- Задание 9
+WITH NumberedPayments AS (
+    SELECT
+        EXTRACT(YEAR FROM fact_transaction_timestamp) AS payment_year,
+        amount,
+        fact_transaction_timestamp,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM fact_transaction_timestamp) 
+            ORDER BY fact_transaction_timestamp
+        ) AS payment_num
+    FROM stroy.project_payment
+    WHERE fact_transaction_timestamp IS NOT NULL
+),
+FilteredPayments AS (
+    SELECT
+        payment_year,
+        amount,
+        fact_transaction_timestamp,
+        AVG(amount) OVER (
+            ORDER BY fact_transaction_timestamp 
+            ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING
+        ) AS sliding_avg_amount
+    FROM NumberedPayments
+    WHERE payment_num % 5 = 0
+),
+SumCalculations AS (
+    SELECT
+        payment_year,
+        SUM(sliding_avg_amount) AS total_sliding_avg
+    FROM FilteredPayments
+    GROUP BY payment_year
+),
+ProjectSumByYear AS (
+    SELECT
+        EXTRACT(YEAR FROM sign_date) AS project_year,
+        SUM(project_cost) AS total_project_cost
+    FROM stroy.project
+    GROUP BY EXTRACT(YEAR FROM sign_date)
+)
+SELECT
+    ps.project_year,
+    ps.total_project_cost
+FROM ProjectSumByYear ps
+JOIN SumCalculations sc ON ps.project_year = sc.payment_year
+WHERE ps.total_project_cost < sc.total_sliding_avg
+ORDER BY ps.project_year;
+-- Задание 10
+-- Задание 10
+DROP MATERIALIZED VIEW IF EXISTS project_report;
+
+CREATE MATERIALIZED VIEW project_report AS
+SELECT 
+    p.project_id,
+    p.project_name,
+    last_pay.fact_transaction_timestamp AS last_payment_date,
+    last_pay.amount AS last_payment_amount,
+    per.last_name || ' ' || per.first_name AS manager_fio,
+    c.customer_name,
+    STRING_AGG(wt.type_of_work_name, ', ') AS work_types
+FROM stroy.project p
+JOIN stroy.person per ON p.project_manager_id = per.person_id
+JOIN stroy.customer c ON p.customer_id = c.customer_id
+LEFT JOIN stroy.customer_type_of_work ctw ON c.customer_id = ctw.customer_id
+LEFT JOIN stroy.type_of_work wt ON ctw.type_of_work_id = wt.type_of_work_id
+LEFT JOIN (
+    SELECT 
+        project_id,
+        fact_transaction_timestamp,
+        amount,
+        ROW_NUMBER() OVER (
+            PARTITION BY project_id 
+            ORDER BY fact_transaction_timestamp DESC
+        ) AS rn
+    FROM stroy.project_payment
+    WHERE fact_transaction_timestamp IS NOT NULL
+) last_pay ON p.project_id = last_pay.project_id AND last_pay.rn = 1
+GROUP BY 
+    p.project_id,
+    p.project_name,
+    last_pay.fact_transaction_timestamp,
+    last_pay.amount,
+    per.last_name,
+    per.first_name,
+    c.customer_name;
+SELECT * FROM project_report;
